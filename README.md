@@ -29,43 +29,52 @@ This project implements a GCS bucket security scanner that:
 ## Usage
 
 ```bash
-# Scan a specific bucket (with API key)
+# Offline demo (no cloud, no credentials) — audit bundled fixtures
+python3 gcs_scanner.py --demo
+
+# Audit a custom bucket-state fixtures file (offline)
+python3 gcs_scanner.py --fixtures fixtures/gcs-buckets.json
+
+# Offline audit with JSON report + CI exit code
+python3 gcs_scanner.py --demo --output reports/cl2-report.json --exit-code-on-findings
+
+# Live (authorized, your own project): scan a specific bucket
 python3 gcs_scanner.py --api-key AIza... --bucket my-target-bucket
 
-# Scan with service account
+# Scan with service account (credentials supplied at runtime only)
 python3 gcs_scanner.py --sa-json service-account.json --bucket my-bucket
 
 # Enumerate from wordlist
 python3 gcs_scanner.py --api-key AIza... --enum
-
-# List objects in a bucket
-python3 gcs_scanner.py --api-key AIza... --bucket my-bucket --list-objects
-
-# Full scan with JSON output
-python3 gcs_scanner.py --api-key AIza... --bucket my-bucket --output results.json
 ```
 
-## Example Output
+## Exit Codes
 
-```
-  Scanning GCS Bucket: my-target-bucket
-============================================================
-  Public Read:     YES — PUBLIC
-    Role:          roles/storage.objectViewer
-  Public Write:    No
-  Default ACL:     Public (allUsers)
-  CORS:            Wildcard origin (*)
-  Lifecycle:       0 rules
-  Versioning:      Disabled
-  Labels:          {}
-  IAM Bindings:    2
-    ⚠  roles/storage.objectViewer → allUsers
-  Risk Score:      50/100 (HIGH)
-```
+- `0` — completed cleanly (or demo finished without explicit CRITICAL/HIGH gate)
+- `1` — error (missing fixtures, unreadable file, bad JSON)
+- `2` — CRITICAL/HIGH findings present with `--exit-code-on-findings`
+
+## Live Lab Test Plan
+
+Runs entirely offline against `fixtures/gcs-buckets.json` — no GCP project, no key, no network.
+
+1. **Demo**: `python3 gcs_scanner.py --demo` — expect CRITICAL/HIGH/MEDIUM/LOW findings for the public IAM bindings, public ACL entries, disabled uniform-bucket-level-access, wildcard CORS, disabled versioning, missing lifecycle rules, disabled logging, and Google-managed (non-CMEK) encryption. Exit `0`.
+2. **JSON report**: `python3 gcs_scanner.py --demo --output reports/cl2-report.json` — verify the report has `finding_count > 0`, a `summary` map, and per-finding `severity`, `rule_id`, `message`, `remediation`.
+3. **CI exit code**: `python3 gcs_scanner.py --demo --exit-code-on-findings; echo $?` — expect `2`.
+4. **Unit tests**: `python3 -m unittest discover -s tests -v` — all pass (exercises the full fixture rule set + base64url helper).
+5. **Live (optional)**: pass your own `--api-key`/`--sa-json`/`--bucket` at runtime. Credentials are used only for that run and are never written to disk. Only probe buckets in projects you own or are authorized to test.
+
+## Metrics
+
+- Detection rules exercised offline (all real code paths): public IAM binding (CL2-IAM-001), public ACL entry (CL2-ACL-001), wildcard CORS (CL2-COR-001), versioning disabled (CL2-CFG-001), lifecycle missing (CL2-CFG-002), logging disabled (CL2-CFG-003), uniform bucket-level access disabled (CL2-CFG-005), non-CMEK encryption default (CL2-CFG-004)
+- Every finding carries `severity`, `category`, `rule_id`, `bucket`, `message`, and a `remediation` string
+- Role-severity mapping matches GCS IAM semantics (`roles/storage.admin`/`objectAdmin` → CRITICAL, legacy writer/bucket owner → HIGH)
+- Exit-code contract: `0` clean / `1` error / `2` findings (with `--exit-code-on-findings`)
+- Zero third-party dependencies; `--demo` requires no network of any kind
 
 ## Legal Disclaimer
 
-**IMPORTANT: Read before use.**
+## IMPORTANT: Read before use.
 
 This project is provided for **educational and authorized security testing purposes only**.
 

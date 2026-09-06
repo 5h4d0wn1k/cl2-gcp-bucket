@@ -1,0 +1,59 @@
+{
+  "project_id": "docu-lab-project-192000",
+  "buckets": [
+    {
+      "name": "lab-prod-assets",
+      "location": "US-EAST1",
+      "iam_policy": {
+        "bindings": [
+          {"role": "roles/storage.objectViewer", "members": ["allUsers"]},
+          {"role": "roles/storage.objectAdmin", "members": ["user:data-eng@example.com"]}
+        ]
+      },
+      "acl_entries": [
+        {"entity": "allUsers", "role": "READER"},
+        {"entity": "user:data-eng@example.com", "role": "OWNER"}
+      ],
+      "uniform_bucket_level_access": false,
+      "cors": [{"origin": ["*"], "method": ["GET"], "responseHeader": ["*"]}],
+      "versioning": {"enabled": false},
+      "lifecycle": {"rule_count": 0, "rules": []},
+      "logging": {"enabled": false},
+      "labels": {"env": "prod", "team": "data"}
+    },
+    {
+      "name": "lab-archive",
+      "location": "EUROPE-WEST1",
+      "iam_policy": {
+        "bindings": [
+          {"role": "roles/storage.objectViewer",
+           "members": ["serviceAccount:backup-sa@docu-lab-project-192000.iam.gserviceaccount.com"]}
+        ]
+      },
+      "acl_entries": [],
+      "uniform_bucket_level_access": true,
+      "cors": [],
+      "versioning": {"enabled": true},
+      "lifecycle": {"rule_count": 2, "rules": [{"age": 365}, {"age": 1825}]},
+      "logging": {"enabled": true},
+      "labels": {"env": "prod", "team": "backup"}
+    },
+    {
+      "name": "lab-public-www",
+      "location": "US-CENTRAL1",
+      "iam_policy": {
+        "bindings": [
+          {"role": "roles/storage.admin", "members": ["allUsers"]}
+        ]
+      },
+      "acl_entries": [
+        {"entity": "allAuthenticatedUsers", "role": "WRITER"}
+      ],
+      "uniform_bucket_level_access": false,
+      "cors": [{"origin": ["https://www.example.com"], "method": ["GET"]}],
+      "versioning": {"enabled": false},
+      "lifecycle": {"rule_count": 0},
+      "logging": {"enabled": false}
+    }
+  ]
+}

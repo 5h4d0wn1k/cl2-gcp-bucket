@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -367,18 +368,251 @@ def print_banner():
     print(banner)
 
 
+# ---------------------------------------------------------------------------
+# Offline fixture auditor
+# ---------------------------------------------------------------------------
+
+PUBLIC_MEMBERS = ("allUsers", "allAuthenticatedUsers")
+
+ROLE_SEVERITY = {
+    "roles/storage.objectViewer": "MEDIUM",
+    "roles/storage.objectCreator": "MEDIUM",
+    "roles/storage.objectAdmin": "CRITICAL",
+    "roles/storage.legacyObjectReader": "MEDIUM",
+    "roles/storage.legacyObjectWriter": "HIGH",
+    "roles/storage.legacyBucketOwner": "HIGH",
+    "roles/storage.admin": "CRITICAL",
+    "roles/owner": "CRITICAL",
+}
+
+
+class GCSOfflineAuditor:
+    """Detect GCS bucket misconfigurations from realistic fixture state."""
+
+    def audit(self, buckets):
+        findings = []
+        for bucket in buckets:
+            name = bucket.get("name", "unknown-bucket")
+            findings.extend(self._audit_iam(name, bucket.get("iam_policy")))
+            findings.extend(self._audit_acl(name, bucket.get("acl_entries")))
+            findings.extend(self._audit_cors(name, bucket.get("cors")))
+            findings.extend(self._audit_config(name, bucket))
+        return findings
+
+    def _audit_iam(self, name, iam_policy):
+        findings = []
+        for binding in (iam_policy or {}).get("bindings", []):
+            role = binding.get("role", "")
+            for member in binding.get("members", []):
+                if member in PUBLIC_MEMBERS:
+                    severity = ROLE_SEVERITY.get(role, "HIGH")
+                    findings.append({
+                        "severity": severity,
+                        "category": "iam_policy",
+                        "rule_id": "CL2-IAM-001",
+                        "bucket": name,
+                        "resource": f"gs://{name}",
+                        "message": f"IAM binding grants '{role}' to public member '{member}'.",
+                        "remediation": "Remove public members from the IAM binding; grant access via "
+                                       "service accounts, groups or VPC Service Controls instead.",
+                    })
+        return findings
+
+    def _audit_acl(self, name, acl_entries):
+        findings = []
+        for entry in acl_entries or []:
+            entity = entry.get("entity", "")
+            role = entry.get("role", "")
+            if entity not in PUBLIC_MEMBERS:
+                continue
+            severity = "CRITICAL" if role in ("OWNER", "WRITER") else "MEDIUM"
+            findings.append({
+                "severity": severity,
+                "category": "acl",
+                "rule_id": "CL2-ACL-001",
+                "bucket": name,
+                "resource": f"gs://{name}",
+                "message": f"Bucket ACL grants '{role}' to public entity '{entity}'.",
+                "remediation": "Turn on uniform bucket-level access and drop public ACL entries; keep "
+                               "object access controlled by IAM.",
+            })
+        return findings
+
+    def _audit_cors(self, name, cors):
+        findings = []
+        for rule in cors or []:
+            origins = rule.get("origin", [])
+            if "*" in origins:
+                findings.append({
+                    "severity": "MEDIUM",
+                    "category": "cors",
+                    "rule_id": "CL2-COR-001",
+                    "bucket": name,
+                    "resource": f"gs://{name}",
+                    "message": "CORS rule allows wildcard origin '*'; browser-based clients from any "
+                               "website can make cross-origin requests.",
+                    "remediation": "Restrict CORS origins to explicit trusted domains and methods.",
+                })
+        return findings
+
+    def _audit_config(self, name, bucket):
+        findings = []
+        if not bucket.get("versioning", {}).get("enabled", False):
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "versioning",
+                "rule_id": "CL2-CFG-001",
+                "bucket": name,
+                "resource": f"gs://{name}",
+                "message": "Object versioning is disabled.",
+                "remediation": "Enable versioning to retain object history for recovery and forensics.",
+            })
+
+        lifecycle = bucket.get("lifecycle", {})
+        rule_count = lifecycle.get("rule_count", len(lifecycle.get("rules", [])))
+        if rule_count == 0:
+            findings.append({
+                "severity": "LOW",
+                "category": "lifecycle",
+                "rule_id": "CL2-CFG-002",
+                "bucket": name,
+                "resource": f"gs://{name}",
+                "message": "No lifecycle rules configured; storage has no retention or deletion policy.",
+                "remediation": "Add lifecycle rules with retention/age conditions to avoid unbounded "
+                               "data retention.",
+            })
+
+        if bucket.get("logging") and not bucket.get("logging", {}).get("enabled", False):
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "logging",
+                "rule_id": "CL2-CFG-003",
+                "bucket": name,
+                "resource": f"gs://{name}",
+                "message": "Cloud Storage access logging is disabled.",
+                "remediation": "Enable storage logging to an audit bucket inside the same project.",
+            })
+
+        if bucket.get("require_payer"):
+            pass  # Requester-pays is a hardening choice, not a finding.
+
+        if bucket.get("uniform_bucket_level_access") is False:
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "uniform_bucket_level_access",
+                "rule_id": "CL2-CFG-005",
+                "bucket": name,
+                "resource": f"gs://{name}",
+                "message": "Uniform bucket-level access is disabled; per-object ACLs can override policy.",
+                "remediation": "Enable uniform bucket-level access so object ACLs cannot override policy.",
+            })
+
+        if not (bucket.get("encryption_disable_default_kms", False)):
+            findings.append({
+                "severity": "LOW",
+                "category": "cmeK",
+                "rule_id": "CL2-CFG-004",
+                "bucket": name,
+                "resource": f"gs://{name}",
+                "message": "Bucket uses Google-managed default encryption (no customer-managed key).",
+                "remediation": "For compliance-bound workloads, configure a Cloud KMS customer-managed "
+                               "key and set default_kms_key_name.",
+            })
+        return findings
+
+
+def load_bucket_fixtures(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise FileNotFoundError(f"Fixtures file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in fixtures file {path}: {exc}") from exc
+    if isinstance(data, dict):
+        return data.get("buckets", [])
+    if isinstance(data, list):
+        return data
+    raise ValueError(f"Unsupported fixture structure in {path}")
+
+
+def print_offline_report(buckets, findings):
+    print("\n" + "=" * 64)
+    print("  CL2 — GCP Bucket Offline Misconfiguration Audit")
+    print("=" * 64)
+    print(f"  Buckets audited: {len(buckets)}")
+    print(f"  Findings:        {len(findings)}")
+    print("=" * 64)
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+        if sev in counts:
+            print(f"    {sev:9s}: {counts[sev]}")
+    print()
+    for f in findings:
+        print(f"  [{f['severity']:8s}] {f['rule_id']} {f['bucket']}")
+        print(f"      {f['message']}")
+        print(f"      Fix: {f['remediation']}")
+    print("\n" + "=" * 64 + "\n")
+
+
+def write_report(report, output_path):
+    parent = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(parent, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    print(f"[+] JSON report written to {output_path}")
+
+
 def main():
     print_banner()
     parser = argparse.ArgumentParser(description="GCP Cloud Storage Bucket Scanner")
-    parser.add_argument("--api-key", default="", help="Google Cloud API key")
+    parser.add_argument("--api-key", default="", help="Google Cloud API key (your own at runtime only)")
     parser.add_argument("--sa-json", default="", help="Path to service account JSON")
     parser.add_argument("--bucket", default="", help="Specific bucket to scan")
     parser.add_argument("--enum", action="store_true", help="Enumerate from wordlist")
     parser.add_argument("--list-objects", action="store_true", help="List bucket contents")
     parser.add_argument("--prefix", default="", help="Prefix filter for listing")
     parser.add_argument("--wordlist", nargs="*", help="Extra bucket names to check")
-    parser.add_argument("--output", default="", help="JSON output file")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo against bundled fixture (no network)")
+    parser.add_argument("--fixtures", default="",
+                        help="Path to bucket-state fixtures JSON (offline audit)")
+    parser.add_argument("--output", "-o", default="", help="JSON output file")
+    parser.add_argument("--exit-code-on-findings", action="store_true",
+                        help="Exit 2 when CRITICAL/HIGH findings exist (CI-friendly)")
     args = parser.parse_args()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if args.demo or args.fixtures or not (args.bucket or args.enum or args.api_key or args.sa_json):
+        fixture = args.fixtures or os.path.join(base_dir, "fixtures", "gcs-buckets.json")
+        if not os.path.isfile(fixture):
+            print(f"[!] Fixture not found: {fixture}. Run --demo from the repo root.", file=sys.stderr)
+            return 1
+        print(f"[*] Offline mode — auditing fixtures: {fixture}")
+        try:
+            buckets = load_bucket_fixtures(fixture)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        findings = GCSOfflineAuditor().audit(buckets)
+        print_offline_report(buckets, findings)
+        report = {
+            "tool": "CL2-GCPBucketOfflineAuditor",
+            "mode": "offline-fixture",
+            "finding_count": len(findings),
+            "summary": {},
+            "findings": findings,
+        }
+        for f in findings:
+            report["summary"][f["severity"]] = report["summary"].get(f["severity"], 0) + 1
+        output = args.output or os.path.join(base_dir, "reports", "cl2-report.json")
+        write_report(report, output)
+        if args.exit_code_on_findings and any(f["severity"] in ("CRITICAL", "HIGH") for f in findings):
+            return 2
+        return 0
 
     if not args.api_key and not args.sa_json:
         print("[!] Provide --api-key or --sa-json for full functionality")
@@ -431,7 +665,8 @@ def main():
         print(f"\n[+] Results saved to {args.output}")
 
     print("\n[*] Scan complete.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
